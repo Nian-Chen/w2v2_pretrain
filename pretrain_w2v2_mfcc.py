@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from CzcWav2vec2 import Wav2Vec2ForPreTraining_mfcc
 import math
 import warnings
 import wandb
@@ -253,14 +254,14 @@ class DataCollatorForWav2Vec2Pretraining:
         )
         # sample negative indices
         # 据说从所用帧中采样负样本效果更好，原文中是从mask的帧中采样
-        sampled_negative_indices = _sample_negative_indices(
-            features_shape,
-            self.model.config.num_negatives,
-            mask_time_indices=batch["sub_attention_mask"],
-        )
+        # sampled_negative_indices = _sample_negative_indices(
+        #     features_shape,
+        #     self.model.config.num_negatives,
+        #     mask_time_indices=batch["sub_attention_mask"],
+        # )
         batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long, device=device)
-        batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
-
+        # batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
+        # print(batch)
         return batch
 
 
@@ -362,7 +363,8 @@ class Wav2Vec2PreTrainer(Trainer):
                     else:
                         outputs = model(**inputs)
                     ######################
-                    loss = outputs.loss/inputs["mask_time_indices"].sum()
+                    # loss = outputs.loss/inputs["input_values"].shape[0]
+                    loss = outputs.loss/(inputs["mask_time_indices"]).sum()
 
                     if isinstance(outputs, dict):
                         logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
@@ -719,13 +721,11 @@ class Wav2Vec2PreTrainer(Trainer):
                 ):
                     ###################
                     if (step + 1) % (args.gradient_accumulation_steps * args.logging_steps) == 0 and args.local_rank in [-1, 0]:
-                        outputs.contrastive_loss.detach()
-                        outputs.diversity_loss.detach()
+                        outputs.loss.detach()
                         train_logs = {
-                            "constrast_loss": outputs.contrastive_loss / num_losses,
-                            "div_loss": outputs.diversity_loss / num_losses,
+                            "loss": outputs.loss / num_losses,
                             "%_mask_idx": percent_masked,
-                            "ppl": outputs.codevector_perplexity,
+
                         }
                         wandb.log(train_logs)
 
@@ -937,6 +937,7 @@ class Wav2Vec2PreTrainer(Trainer):
                 loss = loss.mean()
             elif model.module.config.ctc_loss_reduction == "sum":
                 loss = loss.sum() / (inputs["mask_time_indices"]).sum()
+                # loss = loss.sum() / inputs["input_values"].shape[0]
             else:
                 raise ValueError(f"{model.module.config.ctc_loss_reduction} is not valid. Choose one of ['mean', 'sum']")
         else:
@@ -944,6 +945,7 @@ class Wav2Vec2PreTrainer(Trainer):
                 loss = loss.mean()
             elif model.config.ctc_loss_reduction == "sum":
                 loss = loss.sum() / (inputs["mask_time_indices"]).sum()
+                # loss = loss.sum() / inputs["input_values"].shape[0]
             else:
                 raise ValueError(f"{model.config.ctc_loss_reduction} is not valid. Choose one of ['mean', 'sum']")
         if self.args.gradient_accumulation_steps > 1:
@@ -961,14 +963,14 @@ class Wav2Vec2PreTrainer(Trainer):
 
         self.num_update_step += 1
         # make sure gumbel softmax temperature is decayed
-        if self.args.n_gpu > 1 or self.deepspeed or model is not self.model:
-            model.module.set_gumbel_temperature(
-                max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
-            )
-        else:
-            model.set_gumbel_temperature(
-                max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
-            )
+        # if self.args.n_gpu > 1 or self.deepspeed or model is not self.model:
+        #     model.module.set_gumbel_temperature(
+        #         max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
+        #     )
+        # else:
+        #     model.set_gumbel_temperature(
+        #         max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
+        #     )
 
         return loss.detach(), outputs
 
@@ -1027,18 +1029,22 @@ def main():
         model_args.model_name_or_path,
         gradient_checkpointing=False,
     )
+    # config.num_hidden_layers = 1
+    config.mask_time_prob = 0.65
 
     # if not config.do_stable_layer_norm or config.feat_extract_norm != "layer":
     #     raise ValueError(
     #         "PreTraining is only supported for ``config.do_stable_layer_norm=True`` and ``config.feat_extract_norm='layer'"
     #     )
 
-    model = Wav2Vec2ForPreTraining(config)
+    model = Wav2Vec2ForPreTraining_mfcc(config)
 
     if is_wandb_available() and training_args.local_rank in [0, -1]:
         # 只跟踪主进程，DDP下主进程local_rank为0，正常情况为-1
         import wandb
+        config = {**vars(model_args), **vars(data_args), **vars(training_args)}
         wandb.init(project=training_args.logging_dir.split("/")[-1])
+        wandb.config.update(config)
         wandb.watch(model, log="all")
 
     data_collator = DataCollatorForWav2Vec2Pretraining(model=model, feature_extractor=processor)

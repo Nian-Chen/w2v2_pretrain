@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+from CzcWav2vec2 import (
+    Wav2Vec2ForPreTraining_mfcc,
+    Wav2Vec2ForPreTraining_mfcc_auxiliary,
+    get_czc_scheduler,
+    get_w2v2_scheduler,
+    Wav2Vec2ForPreTraining_mae,
+    _compute_mask_indices_random
+)
 import math
 import warnings
 import wandb
@@ -79,7 +87,7 @@ if is_apex_available():
 if version.parse(torch.__version__) >= version.parse("1.6"):
     _is_native_amp_available = True
     from torch.cuda.amp import autocast
-
+from transformers.optimization import get_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -251,16 +259,22 @@ class DataCollatorForWav2Vec2Pretraining:
             self.model.config.mask_time_length,
             attention_mask=batch['sub_attention_mask'],
         )
+        # mask_time_indices = _compute_mask_indices_random(
+            # features_shape,
+            # self.model.config.mask_time_prob,
+            # attention_mask=batch['sub_attention_mask'],
+        # )
+        
         # sample negative indices
         # 据说从所用帧中采样负样本效果更好，原文中是从mask的帧中采样
-        sampled_negative_indices = _sample_negative_indices(
-            features_shape,
-            self.model.config.num_negatives,
-            mask_time_indices=batch["sub_attention_mask"],
-        )
+        # sampled_negative_indices = _sample_negative_indices(
+            # features_shape,
+            # self.model.config.num_negatives,
+            # mask_time_indices=batch["sub_attention_mask"],
+        # )
         batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long, device=device)
-        batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
-
+        # batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
+        # print(batch)
         return batch
 
 
@@ -275,6 +289,44 @@ class Wav2Vec2PreTrainer(Trainer):
         self.max_gumbel_temp = max_gumbel_temp
         self.min_gumbel_temp = min_gumbel_temp
         self.gumbel_temp_decay = gumbel_temp_decay
+        self.use_w2v2_lr_scheduler = False
+        self.use_czc_lr_scheduler = False
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        """
+        Setup the scheduler. The optimizer of the trainer must have been set up before this method is called.
+
+        Args:
+            num_training_steps (int): The number of training steps to do.
+        """
+        # print(self.optimizer)
+        if self.lr_scheduler is None:
+            warmup_steps = (
+                self.args.warmup_steps
+                if self.args.warmup_steps > 0
+                else math.ceil(num_training_steps * self.args.warmup_ratio)
+            )
+            if self.use_czc_lr_scheduler:
+                print("use_czc_lr_scheduler")
+                self.lr_scheduler = get_czc_scheduler(
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                )
+                
+            elif self.use_w2v2_lr_scheduler:
+                print("use_w2v2_lr_scheduler")
+                self.lr_scheduler = get_w2v2_scheduler(
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                )
+            else:
+                self.lr_scheduler = get_scheduler(
+                    self.args.lr_scheduler_type,
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                )
     def prediction_step(
         self,
         model: nn.Module,
@@ -719,13 +771,13 @@ class Wav2Vec2PreTrainer(Trainer):
                 ):
                     ###################
                     if (step + 1) % (args.gradient_accumulation_steps * args.logging_steps) == 0 and args.local_rank in [-1, 0]:
-                        outputs.contrastive_loss.detach()
-                        outputs.diversity_loss.detach()
+                        outputs.loss.detach()
                         train_logs = {
-                            "constrast_loss": outputs.contrastive_loss / num_losses,
-                            "div_loss": outputs.diversity_loss / num_losses,
+                            "loss": outputs.loss / num_losses,
+                            # "auxiliary": outputs.auxiliary_loss / num_losses,
+                            # "div_loss": outputs.diversity_loss / num_losses,
                             "%_mask_idx": percent_masked,
-                            "ppl": outputs.codevector_perplexity,
+                            # "ppl": outputs.codevector_perplexity,
                         }
                         wandb.log(train_logs)
 
@@ -937,6 +989,7 @@ class Wav2Vec2PreTrainer(Trainer):
                 loss = loss.mean()
             elif model.module.config.ctc_loss_reduction == "sum":
                 loss = loss.sum() / (inputs["mask_time_indices"]).sum()
+                # loss = loss.sum() / inputs["input_values"].shape[0]
             else:
                 raise ValueError(f"{model.module.config.ctc_loss_reduction} is not valid. Choose one of ['mean', 'sum']")
         else:
@@ -944,6 +997,7 @@ class Wav2Vec2PreTrainer(Trainer):
                 loss = loss.mean()
             elif model.config.ctc_loss_reduction == "sum":
                 loss = loss.sum() / (inputs["mask_time_indices"]).sum()
+                # loss = loss.sum() / inputs["input_values"].shape[0]
             else:
                 raise ValueError(f"{model.config.ctc_loss_reduction} is not valid. Choose one of ['mean', 'sum']")
         if self.args.gradient_accumulation_steps > 1:
@@ -961,14 +1015,14 @@ class Wav2Vec2PreTrainer(Trainer):
 
         self.num_update_step += 1
         # make sure gumbel softmax temperature is decayed
-        if self.args.n_gpu > 1 or self.deepspeed or model is not self.model:
-            model.module.set_gumbel_temperature(
-                max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
-            )
-        else:
-            model.set_gumbel_temperature(
-                max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
-            )
+        # if self.args.n_gpu > 1 or self.deepspeed or model is not self.model:
+        #     model.module.set_gumbel_temperature(
+        #         max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
+        #     )
+        # else:
+        #     model.set_gumbel_temperature(
+        #         max(self.max_gumbel_temp * self.gumbel_temp_decay ** self.num_update_step, self.min_gumbel_temp)
+        #     )
 
         return loss.detach(), outputs
 
@@ -981,9 +1035,9 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     configure_logger(model_args, training_args)
-    logger.info(f"{stars}model_args:{stars}\n{model_args}")
-    logger.info(f"{stars}data_args:{stars}\n{data_args}")
-    logger.info(f"{stars}training_args:{stars}\n{training_args}")
+    # logger.info(f"{stars}model_args:{stars}\n{model_args}")
+    # logger.info(f"{stars}data_args:{stars}\n{data_args}")
+    # logger.info(f"{stars}training_args:{stars}\n{training_args}")
 
     # Downloading and loading a dataset from the hub.
     dataset_dir = data_args.dataset_dir
@@ -1027,18 +1081,23 @@ def main():
         model_args.model_name_or_path,
         gradient_checkpointing=False,
     )
+    # config.num_hidden_layers = 1
+    # config.mask_time_prob = 0.65
 
     # if not config.do_stable_layer_norm or config.feat_extract_norm != "layer":
     #     raise ValueError(
     #         "PreTraining is only supported for ``config.do_stable_layer_norm=True`` and ``config.feat_extract_norm='layer'"
     #     )
 
-    model = Wav2Vec2ForPreTraining(config)
+    model = Wav2Vec2ForPreTraining_mae(config)
 
     if is_wandb_available() and training_args.local_rank in [0, -1]:
         # 只跟踪主进程，DDP下主进程local_rank为0，正常情况为-1
         import wandb
+        config = {"command":sys.argv,**vars(model_args), **vars(data_args), **vars(training_args), **vars(model.config)}
+        logger.info(config)
         wandb.init(project=training_args.logging_dir.split("/")[-1])
+        wandb.config.update(config)
         wandb.watch(model, log="all")
 
     data_collator = DataCollatorForWav2Vec2Pretraining(model=model, feature_extractor=processor)
@@ -1054,7 +1113,7 @@ def main():
         min_gumbel_temp=model_args.min_gumbel_temperature,
         gumbel_temp_decay=model_args.gumbel_temperature_decay,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,155 @@
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig
-from transformers import  Wav2Vec2Processor, Wav2Vec2Config, EncoderDecoderConfig, EncoderDecoderModel, GPT2Config, Wav2Vec2PreTrainedModel
-from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2ForPreTrainingOutput
+from transformers import Wav2Vec2Processor, Wav2Vec2Config, EncoderDecoderConfig, EncoderDecoderModel, GPT2Config, \
+    Wav2Vec2PreTrainedModel
+from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2ForPreTrainingOutput, Wav2Vec2ForPreTraining, \
+    _compute_mask_indices, _sample_negative_indices, Wav2Vec2ForSequenceClassification, Wav2Vec2Model, Wav2Vec2BaseModelOutput, \
+    Wav2Vec2EncoderLayerStableLayerNorm, Wav2Vec2EncoderStableLayerNorm, Wav2Vec2PositionalConvEmbedding
 import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 from torch import nn
 from transformers.modeling_outputs import Seq2SeqLMOutput, CausalLMOutput, CausalLMOutputWithCrossAttentions
-from transformers import AutoTokenizer, AutoModelForCausalLM, GPT2Tokenizer, Wav2Vec2ForCTC, GPT2LMHeadModel, Wav2Vec2Model
+from transformers import AutoTokenizer, AutoModelForCausalLM, GPT2Tokenizer, Wav2Vec2ForCTC, GPT2LMHeadModel, \
+    Wav2Vec2Model
 from torch.nn import CrossEntropyLoss, MSELoss
 from speechbrain.lobes import features
+from speechbrain.processing.features import STFT,spectral_magnitude
 from datasets import DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from torchaudio import sox_effects
+from transformers.file_utils import ModelOutput
+import scipy.io as sio
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
+import numpy as np
+def _compute_mask_indices_random(
+    shape: Tuple[int, int],
+    mask_prob: float,
+    attention_mask: Optional[torch.LongTensor] = None,
+    min_masks: int = 1,
+) -> np.ndarray:
+    """
+    Computes random mask spans for a given shape. Used to implement `SpecAugment: A Simple Data Augmentation Method for
+    ASR <https://arxiv.org/abs/1904.08779>`__. Note that this method is not optimized to run on TPU and should be run
+    on CPU as part of the preprocessing during training.
+
+    Args:
+        shape: the the shape for which to compute masks.
+            should be of size 2 where first element is batch size and 2nd is timesteps
+        mask_prob: probability for each token to be chosen as start of the span to be masked. this will be multiplied by
+            number of timesteps divided by length of mask span to mask approximately this percentage of all elements.
+            however due to overlaps, the actual number will be smaller (unless no_overlap is True)
+        mask_length: size of the mask
+        min_masks: minimum number of masked spans
+    """
+    batch_size, sequence_length = shape
+    epsilon = np.random.rand(1).item()
+
+    def compute_num_masked_span(input_length):
+        """Given input length, compute how many spans should be masked"""
+        num_masked_span = int(mask_prob * input_length + epsilon)
+        num_masked_span = max(num_masked_span, min_masks)
+
+        # make sure num masked indices <= sequence_length
+        num_masked_span = sequence_length if num_masked_span > sequence_length else num_masked_span
+        return num_masked_span
+
+    # compute number of masked spans in batch
+    input_lengths = (
+        attention_mask.sum(-1).detach().tolist()
+        if attention_mask is not None
+        else [sequence_length for _ in range(batch_size)]
+    )
+    # print(f"input_lengths = {input_lengths}")
+    # SpecAugment mask to fill
+    spec_aug_mask = np.zeros((batch_size, sequence_length), dtype=np.bool)
+    spec_aug_mask_idxs = []
+
+    max_num_masked_span = compute_num_masked_span(sequence_length)
+    
+    for input_length in input_lengths:
+        # compute num of masked spans for this input
+        num_masked_span = compute_num_masked_span(input_length)
+        # print(f"num_masked_span = {num_masked_span}")
+        # get random indices to mask
+        spec_aug_mask_idx = np.random.choice(
+            np.arange(input_length), num_masked_span, replace=False
+        )
+        # print(f"spec_aug_mask_idx = {spec_aug_mask_idx}")
+
+        # pick first sampled index that will serve as a dummy index to pad vector
+        dummy_mask_idx = spec_aug_mask_idx[0]
+
+        spec_aug_mask_idx = np.concatenate(
+            [spec_aug_mask_idx, np.ones(max_num_masked_span - num_masked_span, dtype=np.int32) * dummy_mask_idx]
+        )
+        spec_aug_mask_idxs.append(spec_aug_mask_idx)
+
+    spec_aug_mask_idxs = np.array(spec_aug_mask_idxs)
+
+    # scatter indices to mask
+    np.put_along_axis(spec_aug_mask, spec_aug_mask_idxs, 1, -1)
+
+    return spec_aug_mask
+
+def get_czc_scheduler(
+    optimizer: Optimizer, num_warmup_steps: int, num_training_steps: int, lr_end=1e-7, power=2.0, last_epoch: int = -1
+):
+    lr_init = optimizer.defaults["lr"]
+    assert lr_init > lr_end, f"lr_end ({lr_end}) must be be smaller than initial lr ({lr_init})"
+    def lr_lambda(current_step):
+        num_last_steps = 0.6 * num_training_steps
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        elif current_step > num_last_steps:
+            lr_range = lr_init - lr_end
+            decay_steps = num_training_steps - num_last_steps
+            pct_remaining = 1 - (current_step - num_last_steps) / decay_steps
+            decay = lr_range * pct_remaining ** power + lr_end
+            return decay / lr_init  # as LambdaLR multiplies by lr_init
+        elif current_step > num_training_steps:
+            return lr_end / lr_init  # as LambdaLR multiplies by lr_init 不是return 1
+        else:
+            return 1  # as LambdaLR multiplies by lr_init 不是return 1
+        
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+def get_w2v2_scheduler(
+    optimizer: Optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1
+):
+    def lr_lambda(current_step):
+        num_last_steps = 0.5 * num_training_steps
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        elif current_step > num_last_steps:
+            return max(
+            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_last_steps))
+        )        
+        return 1
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+class Wav2Vec2ForPreTrainingOutput_mfcc_auxiliary(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    projected_states: torch.FloatTensor = None
+    mfcc_pred: torch.FloatTensor = None
+    mfcc_target: torch.FloatTensor = None
+    projected_quantized_states: torch.FloatTensor = None
+    codevector_perplexity: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    contrastive_loss: Optional[torch.FloatTensor] = None
+    diversity_loss: Optional[torch.FloatTensor] = None
+    auxiliary_loss: Optional[torch.FloatTensor] = None
+
+
+class Wav2Vec2ForPreTrainingOutput_mfcc(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    mfcc_pred: torch.FloatTensor = None
+    mfcc_target: torch.FloatTensor = None
+    mae_decoder_input: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+
 class GPT2_Decoder(GPT2LMHeadModel):
     def LabelSmoothingLoss(
             self,
@@ -516,17 +655,225 @@ class Wav2vec2_Gpt2(EncoderDecoderModel):
         return encoder_hidden_states.detach(), enc_frame_attention_mask.detach(), encoder_logits.detach()
 
 
+class Wav2Vec2ForPreTraining_mfcc_auxiliary(Wav2Vec2ForPreTraining):
+    def __init__(self, config: Wav2Vec2Config):
+        super().__init__(config)
+        # 不要设置在此处，会被计入参数，并且影响多卡gpu计算（参数同步）
+        # self.compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
+                                          # left_frames=0, right_frames=0)
+        self.mfcc_dim = 39
+        
+        self.mfcc_aux_weight = config.mfcc_aux_weight
+        self.use_consine_loss = config.use_consine_loss
+        self.mfcc_aux_z = config.mfcc_aux_z
+        self.mfcc_aux_q = config.mfcc_aux_q
+        self.mfcc_aux_c = config.mfcc_aux_c
+        self.pred_mfcc_onlymasked = config.pred_mfcc_onlymasked
+        if self.mfcc_aux_q:
+            self.mfcc_projection_q = nn.Linear(self.config.proj_codevector_dim, self.mfcc_dim)
+        elif self.mfcc_aux_c:
+            self.mfcc_projection_c = nn.Linear(self.config.hidden_size, self.mfcc_dim)
+        elif self.mfcc_aux_z:
+            self.mfcc_projection_z = nn.Linear(self.config.conv_dim[-1], self.mfcc_dim)
+        else:
+            raise ValueError("NO AUX SELECTION")
+        self.init_weights()
+        
+
+    def forward(
+            self,
+            input_values,
+            attention_mask=None,
+            mask_time_indices=None,
+            sampled_negative_indices=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+    ):
+        r"""
+        mask_time_indices (:obj:`torch.BoolTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Indices to mask extracted features for contrastive loss. When in training mode, model learns to predict
+            masked extracted features in `config.proj_codevector_dim` space.
+        sampled_negative_indices (:obj:`torch.BoolTensor` of shape :obj:`(batch_size, sequence_length, num_negatives)`, `optional`):
+            Indices indicating which quantized target vectors are used as negative sampled vectors in contrastive loss.
+            Required input for pre-training.
+
+        Returns:
+
+        Example::
+
+            >>> import torch
+            >>> from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForPreTraining
+            >>> from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices
+            >>> from datasets import load_dataset
+            >>> import soundfile as sf
+
+            >>> feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("patrickvonplaten/wav2vec2-base")
+            >>> model = Wav2Vec2ForPreTraining.from_pretrained("patrickvonplaten/wav2vec2-base")
+
+
+            >>> def map_to_array(batch):
+            ...     speech, _ = sf.read(batch["file"])
+            ...     batch["speech"] = speech
+            ...     return batch
+
+
+            >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+            >>> ds = ds.map(map_to_array)
+
+            >>> input_values = feature_extractor(ds["speech"][0], return_tensors="pt").input_values  # Batch size 1
+
+            >>> # compute masked indices
+            >>> batch_size, raw_sequence_length = input_values.shape
+            >>> sequence_length = model._get_feat_extract_output_lengths(raw_sequence_length)
+            >>> mask_time_indices = _compute_mask_indices((batch_size, sequence_length), mask_prob=0.2, mask_length=2, device=model.device)
+
+            >>> with torch.no_grad():
+            ...     outputs = model(input_values, mask_time_indices=mask_time_indices)
+
+            >>> # compute cosine similarity between predicted (=projected_states) and target (=projected_quantized_states)
+            >>> cosine_sim = torch.cosine_similarity(
+            ...     outputs.projected_states, outputs.projected_quantized_states, dim=-1
+            ... )
+
+            >>> # show that cosine similarity is much higher than random
+            >>> assert cosine_sim[mask_time_indices].mean() > 0.5
+
+            >>> # for contrastive loss training model should be put into train mode
+            >>> model.train()
+            >>> loss = model(input_values, mask_time_indices=mask_time_indices).loss
+        """
+        compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
+                                          left_frames=0, right_frames=0)
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if mask_time_indices is not None:
+            mask_time_indices = mask_time_indices.to(torch.bool)
+
+        outputs = self.wav2vec2(
+            input_values,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            mask_time_indices=mask_time_indices,
+            return_dict=return_dict,
+        )
+
+        # 1. project all transformed features (including masked) to final vq dim
+        transformer_features = self.project_hid(outputs[0])
+
+        # 2. quantize all (unmasked) extracted features and project to final vq dim
+        extract_features = self.dropout_features(outputs[1])
+        if attention_mask is not None:
+            # compute reduced attention_mask correponding to feature vectors
+            attention_mask = self._get_feature_vector_attention_mask(extract_features.shape[1], attention_mask)
+
+        quantized_features, codevector_perplexity = self.quantizer(
+            extract_features, mask_time_indices=mask_time_indices
+        )
+        quantized_features = self.project_q(quantized_features)
+        
+        if self.mfcc_aux_q:
+            mfcc_pred = self.mfcc_projection_q(quantized_features)
+        elif self.mfcc_aux_c:
+            mfcc_pred = self.mfcc_projection_c(outputs[0])
+        elif self.mfcc_aux_z:
+            mfcc_pred = self.mfcc_projection_z(outputs[1])
+        maxframe = mfcc_pred.shape[1]
+        # self.compute_mfcc.compute_deltas.kernel = self.compute_mfcc.compute_deltas.kernel.cpu()
+        mfcc = compute_mfcc(input_values.cpu()).to(input_values.device)
+        mfcc = mfcc[:, :maxframe, :].contiguous()
+
+        if self.pred_mfcc_onlymasked:
+            mfcc_target = mfcc[mask_time_indices].reshape(-1, self.mfcc_dim)
+            mfcc_pred = mfcc_pred[mask_time_indices].reshape(-1, self.mfcc_dim)
+        else:
+            mfcc_target = mfcc[attention_mask].reshape(-1, self.mfcc_dim)
+            mfcc_pred = mfcc_pred[attention_mask].reshape(-1, self.mfcc_dim)
+        assert mfcc_target.shape == mfcc_pred.shape
+        if self.use_consine_loss:
+            # 取值在(-1,1)间，需要归到(0,1)间
+            cos_loss = F.cosine_similarity(mfcc_target, mfcc_pred)
+            cos_ones = torch.ones_like(cos_loss)
+            auxiliary_loss = ((cos_ones - cos_loss) * 0.5).sum()
+        else:
+            auxiliary_loss = F.pairwise_distance(mfcc_target,mfcc_pred,p=2).sum()
+                
+        loss = contrastive_loss = diversity_loss = None
+        if sampled_negative_indices is not None:
+            batch_size, sequence_length, hidden_size = quantized_features.shape
+
+            # for training, we sample negatives
+            # 3. sample K negatives (distractors) quantized states for contrastive loss
+            # if attention_mask is passed, make sure that padded feature vectors cannot be sampled
+            # sample negative quantized vectors BTC => (BxT)C
+            negative_quantized_features = quantized_features.view(-1, hidden_size)[
+                sampled_negative_indices.long().view(-1)
+            ]
+            negative_quantized_features = negative_quantized_features.view(
+                batch_size, sequence_length, -1, hidden_size
+            ).permute(2, 0, 1, 3)
+
+            # 4. compute logits, corresponding to `logs = sim(c_t, [q_t, \sim{q}_t]) / \kappa`
+            # of equation (3) in https://arxiv.org/pdf/2006.11477.pdf
+            logits = self.compute_contrastive_logits(
+                quantized_features[None, :],
+                negative_quantized_features,
+                transformer_features,
+                self.config.contrastive_logits_temperature,
+            )
+
+            # 5. if a negative vector is identical to the positive (i.e. when codebook utilization is low),
+            # its cosine similarity will be masked
+            neg_is_pos = (quantized_features == negative_quantized_features).all(-1)
+
+            if neg_is_pos.any():
+                logits[1:][neg_is_pos] = float("-inf")
+
+            # 6. compute contrastive loss \mathbf{L}_m = cross_entropy(logs) =
+            # -log(exp(sim(c_t, q_t)/\kappa) / \sum_{\sim{q}} exp(sim(c_t, \sim{q})/\kappa))
+            logits = logits.transpose(0, 2).reshape(-1, logits.size(0))
+            target = ((1 - mask_time_indices.long()) * -100).transpose(0, 1).flatten()
+
+            contrastive_loss = nn.functional.cross_entropy(logits.float(), target, reduction="sum")
+            # 7. compute diversity loss: \mathbf{L}_d
+            num_codevectors = self.config.num_codevectors_per_group * self.config.num_codevector_groups
+            diversity_loss = ((num_codevectors - codevector_perplexity) / num_codevectors) * mask_time_indices.sum()
+
+            # 8. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d
+
+            loss = contrastive_loss + self.config.diversity_loss_weight * diversity_loss + self.mfcc_aux_weight * auxiliary_loss
+
+        if not return_dict:
+            if loss is not None:
+                return (loss, transformer_features, quantized_features, codevector_perplexity) + outputs[2:]
+            return (transformer_features, quantized_features, codevector_perplexity) + outputs[2:]
+
+        return Wav2Vec2ForPreTrainingOutput_mfcc_auxiliary(
+            loss=loss,
+            projected_states=transformer_features,
+            projected_quantized_states=quantized_features,
+            mfcc_pred=mfcc_pred,
+            mfcc_target=mfcc_target,
+            codevector_perplexity=codevector_perplexity,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            contrastive_loss=contrastive_loss,
+            diversity_loss=diversity_loss,
+            auxiliary_loss=auxiliary_loss
+        )
 class Wav2Vec2ForPreTraining_mfcc(Wav2Vec2PreTrainedModel):
     def __init__(self, config: Wav2Vec2Config):
         super().__init__(config)
         self.wav2vec2 = Wav2Vec2Model(config)
         self.dropout_features = nn.Dropout(config.feat_quantizer_dropout)
-        self.compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
-                                          left_frames=0, right_frames=0)
+        # self.compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
+                                          # left_frames=0, right_frames=0)
         # self.mfcc_norm = nn.LayerNorm(39, eps=config.layer_norm_eps)
         self.mfcc_dim = 39
         self.mfcc_projection = nn.Linear(config.hidden_size, self.mfcc_dim)
-
+        self.pred_mfcc_onlymasked = config.pred_mfcc_onlymasked
+        self.use_consine_loss = config.use_consine_loss
         self.init_weights()
 
     def freeze_feature_extractor(self):
@@ -545,6 +892,8 @@ class Wav2Vec2ForPreTraining_mfcc(Wav2Vec2PreTrainedModel):
             output_hidden_states=None,
             return_dict=None,
     ):
+        compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
+                                          left_frames=0, right_frames=0)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if mask_time_indices is not None:
@@ -562,28 +911,284 @@ class Wav2Vec2ForPreTraining_mfcc(Wav2Vec2PreTrainedModel):
         extract_features = self.dropout_features(extract_features)
         mfcc_pred = self.mfcc_projection(hidden_states)
         maxframe = mfcc_pred.shape[1]
-        self.compute_mfcc.compute_deltas.kernel = self.compute_mfcc.compute_deltas.kernel.cpu()
-        mfcc = self.compute_mfcc(input_values.cpu()).to(input_values.device)
+        # self.compute_mfcc.compute_deltas.kernel = self.compute_mfcc.compute_deltas.kernel.cpu()
+        # mfcc = self.compute_mfcc(input_values.cpu()).to(input_values.device)
+        
+        mfcc = compute_mfcc(input_values.cpu()).to(input_values.device)
         mfcc = mfcc[:, :maxframe, :].contiguous()
         if attention_mask is not None:
             # compute reduced attention_mask correponding to feature vectors
             attention_mask = self._get_feature_vector_attention_mask(extract_features.shape[1], attention_mask)
-        mfcc_target = mfcc[attention_mask].reshape(-1, self.mfcc_dim)
-        mfcc_pred = mfcc_pred[attention_mask].reshape(-1, self.mfcc_dim)
+        # print(self.pred_mfcc_onlymasked)
+        # print(attention_mask.sum(dim=-1))
+        if self.pred_mfcc_onlymasked:
+            mfcc_target = mfcc[mask_time_indices].reshape(-1, self.mfcc_dim)
+            mfcc_pred = mfcc_pred[mask_time_indices].reshape(-1, self.mfcc_dim)
+        else:
+            mfcc_target = mfcc[attention_mask].reshape(-1, self.mfcc_dim)
+            mfcc_pred = mfcc_pred[attention_mask].reshape(-1, self.mfcc_dim)
         assert mfcc_target.shape == mfcc_pred.shape
+        # print(mfcc_target.shape)
         # 取值在(-1,1)间，需要归到(0,1)间
-        cos_loss = F.cosine_similarity(mfcc_target, mfcc_pred)
-        cos_ones = torch.ones_like(cos_loss)
-        loss = ((cos_ones - cos_loss) * 0.5)
+        if self.use_consine_loss:
+            cos_loss = F.cosine_similarity(mfcc_target, mfcc_pred)
+            cos_ones = torch.ones_like(cos_loss)
+            loss = ((cos_ones - cos_loss) * 0.5).sum()
+        else:
+            loss = F.pairwise_distance(mfcc_target,mfcc_pred,p=2).sum()
         if not return_dict:
             if loss is not None:
                 return (loss, mfcc_pred, mfcc_target) + outputs[2:]
             return (mfcc_pred, mfcc_target) + outputs[2:]
 
-        return Wav2Vec2ForPreTrainingOutput(
+        return Wav2Vec2ForPreTrainingOutput_mfcc(
             loss=loss,
-            projected_states=mfcc_pred,
-            projected_quantized_states=mfcc_target,
+            mfcc_pred=mfcc_pred,
+            mfcc_target=mfcc_target,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+
+        )
+class Wav2Vec2Model_mae(Wav2Vec2Model):
+    def remove_mae_mask(
+        self,
+        hidden_states,
+        mask_time_indices,
+        attention_mask,
+    ):
+        # 将mask取出，形成新的hidden_states以及attention_mask
+        # mask_time_indices中true代表mask帧，false代表正常帧
+        # attention_mask中true代表正常帧
+        # print(mask_time_indices.sum(-1))
+        # print(attention_mask.sum(-1))
+        # print((~mask_time_indices * attention_mask).sum(-1))
+        hidden_states_list = []
+        attention_mask_list = []
+        for index in range(hidden_states.shape[0]):
+            mask_att_time_len = (~mask_time_indices * attention_mask).sum(-1)
+            hidden_states_list.append(hidden_states[index][~mask_time_indices[index] * attention_mask[index]])
+            attention_mask_list.append(torch.ones(mask_att_time_len[index],dtype=torch.bool))
+        hidden_states = pad_sequence(hidden_states_list,True, 0)
+        attention_mask = pad_sequence(attention_mask_list,True, 0).to(attention_mask.device)
+        # print("!",attention_mask.sum(-1))
+        return hidden_states,attention_mask
+    def forward(
+        self,
+        input_values,
+        attention_mask=None,
+        mask_time_indices=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        extract_features = self.feature_extractor(input_values)
+        extract_features = extract_features.transpose(1, 2)
+
+        if attention_mask is not None:
+            # compute reduced attention_mask corresponding to feature vectors
+            attention_mask = self._get_feature_vector_attention_mask(extract_features.shape[1], attention_mask)
+
+        hidden_states, extract_features = self.feature_projection(extract_features)
+        # hidden_states = self._mask_hidden_states(
+            # hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
+        # )
+        # print(attention_mask.sum(-1))
+        ##########################
+        hidden_states, attention_mask = self.remove_mae_mask(hidden_states, mask_time_indices, attention_mask)
+        # print(hidden_states.shape)
+        # print(hidden_states)
+        encoder_outputs = self.encoder(
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = encoder_outputs[0]
+        # print(hidden_states.shape)
+        # print(hidden_states)
+        if not return_dict:
+            return (hidden_states, extract_features) + encoder_outputs[1:]
+
+        return Wav2Vec2BaseModelOutput(
+            last_hidden_state=hidden_states,
+            extract_features=extract_features,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+class Wav2Vec2EncoderStableLayerNorm_mae(Wav2Vec2EncoderStableLayerNorm):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.pos_conv_embed = Wav2Vec2PositionalConvEmbedding(config)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout)
+        self.layers = nn.ModuleList(
+            [Wav2Vec2EncoderLayerStableLayerNorm(config) for _ in range(2)]
+        )
+        self.gradient_checkpointing = False
+class Wav2Vec2ForPreTraining_mae(Wav2Vec2PreTrainedModel):
+    def __init__(self, config: Wav2Vec2Config):
+        super().__init__(config)
+        self.wav2vec2 = Wav2Vec2Model_mae(config)
+        self.dropout_features = nn.Dropout(config.feat_quantizer_dropout)
+        # self.compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
+                                          # left_frames=0, right_frames=0)
+        # self.mfcc_norm = nn.LayerNorm(39, eps=config.layer_norm_eps)
+        
+        self.mfcc_mae = Wav2Vec2EncoderStableLayerNorm_mae(config)
+        self.pred_raw = False
+        self.mfcc_dim = 80 if not self.pred_raw else 400
+        self.mfcc_projection = nn.Linear(config.hidden_size, self.mfcc_dim)
+        # self.mfcc_layer_norm = nn.LayerNorm(self.mfcc_dim, eps=config.layer_norm_eps)
+        
+        self.pred_mfcc_onlymasked = config.pred_mfcc_onlymasked
+        self.use_consine_loss = config.use_consine_loss
+        self.init_weights()
+
+    def freeze_feature_extractor(self):
+        """
+        Calling this function will disable the gradient computation for the feature extractor so that its parameter
+        will not be updated during training.
+        """
+        self.wav2vec2.feature_extractor._freeze_parameters()
+
+    def forward(
+            self,
+            input_values,
+            attention_mask=None,
+            mask_time_indices=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+    ):
+        # compute_mfcc = features.MFCC(win_length=25, hop_length=20, n_mels=40, n_mfcc=13, deltas=True,
+                                          # left_frames=0, right_frames=0)
+        compute_mfcc = features.Fbank(win_length=25, hop_length=20, n_mels=80,left_frames=0, right_frames=0, context=False, deltas=False)
+        # compute_mfcc = STFT(
+                # sample_rate=16000, win_length=25, hop_length=20, n_fft=512
+            # )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if mask_time_indices is not None:
+            mask_time_indices = mask_time_indices.to(torch.bool)
+
+        outputs = self.wav2vec2(
+            input_values,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            mask_time_indices=mask_time_indices,
+            return_dict=return_dict,
+        )
+        hidden_states, extract_features = outputs[:2]
+        maxframe = extract_features.shape[1]
+        if attention_mask is not None:
+            # compute reduced attention_mask correponding to feature vectors
+            attention_mask = self._get_feature_vector_attention_mask(extract_features.shape[1], attention_mask)
+        # 再获取一次取出mask帧后的新的_attention_mask
+        _, _attention_mask = self.wav2vec2.remove_mae_mask(extract_features, mask_time_indices, attention_mask)
+        hidden_states_flat = hidden_states[_attention_mask]
+        # print(hidden_states_flat.shape)
+        # print(extract_features.shape)
+        extract_features = self.dropout_features(extract_features)
+        # self.compute_mfcc.compute_deltas.kernel = self.compute_mfcc.compute_deltas.kernel.cpu()
+        # mfcc = self.compute_mfcc(input_values.cpu()).to(input_values.device)
+        
+        if self.pred_raw:
+            c = torch.nn.Conv1d(1, 400, kernel_size=(400,), stride=(320,), bias=False)
+            # 构建固定卷积核, 需要大写Tensor
+            # 输入(4,720)先转为(4,1,720) 经400个卷积核即(400,1,400) 得到(4,400,2)再转为(4,2,400)
+            # 这400代表的是原采样点，类似图像领域的分patch
+            c.weight.data = torch.Tensor(torch.eye(400).unsqueeze(1))
+            c.weight.requires_grad=False
+            mfcc = c(input_values.unsqueeze(1).cpu()).transpose(-2, -1).to(hidden_states_flat.device)
+            # print(mfcc.shape)
+        else:
+            mfcc = compute_mfcc(input_values.cpu()).to(hidden_states_flat.device)
+            if self.mfcc_dim == 257:
+                mfcc = spectral_magnitude(mfcc)
+            mfcc = mfcc[:, :maxframe, :].contiguous()
+            # mfcc = self.mfcc_layer_norm(mfcc)
+            # print(mfcc)
+            mean = mfcc.mean(dim=-1, keepdim=True)
+            var = mfcc.var(dim=-1, keepdim=True)
+            mfcc = (mfcc - mean) / (var + 1.e-6)**.5
+            # print(mfcc)
+            
+        # mfcc是未取出mask的原大小
+        mae_decoder_input = torch.zeros(mfcc.shape[0],mfcc.shape[1],hidden_states.shape[2]).to(mfcc.device)
+        # print(mae_decoder_input.shape)
+        # mae_decoder_input = mae_decoder_input[attention_mask]
+        # print(mask_time_indices.shape,mask_time_indices.sum(-1))
+        # print(attention_mask.shape,attention_mask.sum(-1))
+        # print(mask_time_indices.sum(-1))
+        # print(attention_mask.sum(-1))
+        # print((~mask_time_indices * attention_mask).sum(-1))
+        mae_decoder_input[~mask_time_indices * attention_mask] = hidden_states_flat
+        mae_decoder_input[mask_time_indices] = self.wav2vec2.masked_spec_embed
+        # print(self.wav2vec2.masked_spec_embed)
+        # print(mfcc_pred)
+        
+        # if attention_mask is not None:
+            # # extend attention_mask
+            # attention_mask_ = (1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)) * -10000.0
+            # attention_mask_ = attention_mask_.expand(
+                # attention_mask_.shape[0], 1, attention_mask_.shape[-1], attention_mask_.shape[-1]
+            # )
+        mfcc_pred = self.mfcc_mae(mae_decoder_input, attention_mask=attention_mask)[0]
+        mfcc_pred = self.mfcc_projection(mfcc_pred)
+        # print(mfcc_pred.shape)
+        
+        
+
+        # print(self.pred_mfcc_onlymasked)
+        # print(attention_mask.sum(dim=-1))
+        if self.pred_mfcc_onlymasked:
+            mfcc_target_ = mfcc
+            mfcc_target = mfcc[mask_time_indices].reshape(-1, self.mfcc_dim)
+            mfcc_pred_ = mfcc_pred
+            mfcc_pred = mfcc_pred[mask_time_indices].reshape(-1, self.mfcc_dim)
+        else:
+            mfcc_target = mfcc[attention_mask].reshape(-1, self.mfcc_dim)
+            # print(mfcc_target.shape)
+            mfcc_pred = mfcc_pred[attention_mask].reshape(-1, self.mfcc_dim)
+        assert mfcc_target.shape == mfcc_pred.shape
+        # print(mfcc_target.shape)
+        # 取值在(-1,1)间，需要归到(0,1)间
+        if self.use_consine_loss:
+            cos_loss = F.cosine_similarity(mfcc_target, mfcc_pred)
+            cos_ones = torch.ones_like(cos_loss)
+            loss = ((cos_ones - cos_loss) * 0.5).sum()
+        else:
+            # loss = F.pairwise_distance(mfcc_target,mfcc_pred,p=2).sum()
+            loss = ((mfcc_target - mfcc_pred)**2).mean(dim=-1).sum()
+        if not return_dict:
+            if loss is not None:
+                return (loss, mfcc_pred, mfcc_target) + outputs[2:]
+            return (mfcc_pred, mfcc_target) + outputs[2:]
+        if self.pred_mfcc_onlymasked:
+            return Wav2Vec2ForPreTrainingOutput_mfcc(
+                loss=loss,
+                mfcc_pred=mfcc_pred_,
+                mfcc_target=mfcc_target_,
+                mae_decoder_input=mae_decoder_input,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+
+            )
+        return Wav2Vec2ForPreTrainingOutput_mfcc(
+            loss=loss,
+            mfcc_pred=mfcc_pred,
+            mfcc_target=mfcc_target,
+            mae_decoder_input=mae_decoder_input,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
 
@@ -599,8 +1204,9 @@ def main():
     model = Wav2vec2_Gpt2(encoder=encoder, decoder=decoder)
     print(model)
     '''
+    
 
-    processor = Wav2Vec2Processor.from_pretrained("/data2_from_58175/huggingface/models/processor-aishell")
+    processor = Wav2Vec2Processor.from_pretrained("/data2_from_58175/huggingface/models/processor_aishell")
     file_path_list = load_from_disk("/home/work/w2v2_pretrain/hf_datasets_aishell2/dev")[:4]["file"]
     input_features = []
     for file_path in file_path_list:
@@ -613,12 +1219,94 @@ def main():
         padding=True,
         return_tensors="pt",
     )
-    model_pred_mfcc =  Wav2Vec2ForPreTraining_mfcc.from_pretrained("/data2_from_58175/huggingface/models/wav2vec2_gpt2/encoder")
+    # model_pred_mfcc =  Wav2Vec2ForPreTraining_mfcc.from_pretrained("/data2_from_58175/huggingface/models/wav2vec2_gpt2/encoder")
+    # model_pred_mfcc = Wav2Vec2ForPreTraining_mfcc.from_pretrained(
+        # "/data2_from_58175/huggingface/models/wav2vec2-base_")
+    config = Wav2Vec2Config.from_pretrained(
+        "/data2_from_58175/huggingface/models/wav2vec2-base_",
+        gradient_checkpointing=False,
+    )
+    config.mask_time_prob = 0.65
+    model_pred_mfcc = Wav2Vec2ForPreTraining_mae(config)
+    # model_pred_mfcc = Wav2Vec2ForPreTraining_mae.from_pretrained(
+        # "/data2_from_58175/huggingface/models/wav2vec2-base_")
     print(model_pred_mfcc)
+    # print(batch)
 
+    device = batch["input_values"].device
+    batch_size = batch["input_values"].shape[0]
+    mask_indices_seq_length = model_pred_mfcc._get_feat_extract_output_lengths(
+        batch["input_values"].shape[-1])
+    features_shape = (batch_size, mask_indices_seq_length)
+    if batch["attention_mask"] is not None:
+        # compute real output lengths according to convolution formula
+        batch["sub_attention_mask"] = model_pred_mfcc._get_feature_vector_attention_mask(
+            mask_indices_seq_length, batch["attention_mask"]
+        )
+    # sample randomly masked indices
+    mask_time_indices = _compute_mask_indices(
+        features_shape,
+        model_pred_mfcc.config.mask_time_prob,
+        model_pred_mfcc.config.mask_time_length,
+        attention_mask=batch['sub_attention_mask'],
+    )
+    batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long, device=device)
+    print(batch["mask_time_indices"].sum(-1))
+    batch.pop("sub_attention_mask")
     output = model_pred_mfcc(**batch)
     print(output)
 
+
+    
+    '''
+    model_pred_mfcc_auxiliary = Wav2Vec2ForPreTraining_mfcc_auxiliary.from_pretrained(
+        "/data2_from_58175/huggingface/models/wav2vec2_gpt2/encoder")
+    print(model_pred_mfcc_auxiliary)
+    device = batch["input_values"].device
+    batch_size = batch["input_values"].shape[0]
+    mask_indices_seq_length = model_pred_mfcc_auxiliary._get_feat_extract_output_lengths(
+        batch["input_values"].shape[-1])
+
+    # make sure that no loss is computed on padded inputs
+    if batch["attention_mask"] is not None:
+        # compute real output lengths according to convolution formula
+        batch["sub_attention_mask"] = model_pred_mfcc_auxiliary._get_feature_vector_attention_mask(
+            mask_indices_seq_length, batch["attention_mask"]
+        )
+    features_shape = (batch_size, mask_indices_seq_length)
+
+    # sample randomly masked indices
+    mask_time_indices = _compute_mask_indices(
+        features_shape,
+        model_pred_mfcc_auxiliary.config.mask_time_prob,
+        model_pred_mfcc_auxiliary.config.mask_time_length,
+        attention_mask=batch['sub_attention_mask'],
+    )
+    # sample negative indices
+    # 据说从所用帧中采样负样本效果更好，原文中是从mask的帧中采样
+    sampled_negative_indices = _sample_negative_indices(
+        features_shape,
+        model_pred_mfcc_auxiliary.config.num_negatives,
+        mask_time_indices=batch["sub_attention_mask"],
+    )
+    batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long, device=device)
+    batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
+    batch.pop("sub_attention_mask")
+    output = model_pred_mfcc_auxiliary(**batch)
+    print(output)
+    '''
+
+
+
+    # batch["labels"] = torch.ones(4,dtype=torch.long)
+    # config_classify = Wav2Vec2Config.from_pretrained(
+    #     "/data2_from_58175/huggingface/models/wav2vec2-base/config.json"
+    # )
+    # model_classify = Wav2Vec2ForSequenceClassification(config_classify)
+    # print(model_classify)
+    # output = model_classify(**batch)
+    # print(output)
+    # sio.loadmat("/data2_from_58175/huggingface/JH/x_train.mat")
 
 # 在被import时__name__不等于__main__，则不会进入main(), 当直接执行本脚本时，__name__=__main__
 if __name__ == "__main__":
